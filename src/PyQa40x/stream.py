@@ -1,12 +1,15 @@
 import threading
 import queue
+import time
 import usb1
 import numpy as np
+
 
 class Stream:
     """
     Class to manage buffer streaming, with event worker thread.
     """
+
     def __init__(self, context, device, registers):
         """
         Initializes the Stream class.
@@ -21,13 +24,27 @@ class Stream:
         self.registers = registers
         self.endpoint_read = usb1.ENDPOINT_IN | 0x02  # EP2 in
         self.endpoint_write = usb1.ENDPOINT_OUT | 0x02  # EP2 out
-        self.dacQueue = queue.Queue(maxsize=5)  # Max. 5 overlapping buffers in flight, block on more
+        self.dacQueue = queue.Queue(
+            maxsize=5
+        )  # Max. 5 overlapping buffers in flight, block on more
         self.adcQueue = queue.Queue()  # Unlimited queue for received data buffers
         self.transfer_helper = usb1.USBTransferHelper()  # Use the callback dispatcher
-        self.transfer_helper.setEventCallback(usb1.TRANSFER_COMPLETED, self.callback)  # Set ours
-        #self.received_data = bytearray()  # Collection of received data bytes
+        # Handle COMPLETED transfers normally; also handle ERROR/TIMED_OUT/CANCELLED
+        # so the queues are always drained and dacQueue.put() never deadlocks.
+        for status in (
+            usb1.TRANSFER_COMPLETED,
+            usb1.TRANSFER_ERROR,
+            usb1.TRANSFER_TIMED_OUT,
+            usb1.TRANSFER_CANCELLED,
+            usb1.TRANSFER_STALL,
+            usb1.TRANSFER_NO_DEVICE,
+            usb1.TRANSFER_OVERFLOW,
+        ):
+            self.transfer_helper.setEventCallback(status, self.callback)
+        # self.received_data = bytearray()  # Collection of received data bytes
         self.thread = None
         self.running = False
+        self._pending_transfers = []  # track all submitted transfers for cancellation
 
     def start(self):
         """
@@ -36,7 +53,7 @@ class Stream:
         self.thread = threading.Thread(target=self.worker)
         self.running = True
         self.thread.start()
-        self.received_data = bytearray() 
+        self.received_data = bytearray()
         self.registers.write(8, 0x05)  # Start streaming
 
     def stop(self):
@@ -44,7 +61,15 @@ class Stream:
         Stops the streaming and ends the worker thread.
         """
         self.running = False
-        self.thread.join()
+        # Cancel any in-flight transfers so their callbacks fire and drain the queues,
+        # allowing the worker thread to exit its loop.
+        for t in self._pending_transfers:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        self._pending_transfers.clear()
+        self.thread.join(timeout=5.0)
         self.registers.write(8, 0x00)  # Stop streaming
 
     def write(self, buffer):
@@ -57,20 +82,28 @@ class Stream:
         transfer = self.device.getTransfer()
         transfer.setBulk(self.endpoint_write, buffer, self.transfer_helper, None, 1000)
         transfer.submit()  # Asynchronous transfer
+        self._pending_transfers.append(transfer)
         self.dacQueue.put(transfer)  # It doesn't matter what we put in here
 
         # Submit a USB bulk transfer to read
         read_transfer = self.device.getTransfer()
-        read_transfer.setBulk(self.endpoint_read, 16384, self.transfer_helper, None, 1000)
+        read_transfer.setBulk(
+            self.endpoint_read, 16384, self.transfer_helper, None, 1000
+        )
         read_transfer.submit()  # Asynchronous transfer
+        self._pending_transfers.append(read_transfer)
         self.adcQueue.put(read_transfer)  # It doesn't matter what we put in here
 
     def worker(self):
         """
         Event loop for the asynchronous transfers.
         """
-        while self.running or not (self.dacQueue.empty() and self.adcQueue.empty()):  # Play until the last
-            self.context.handleEvents()
+        while self.running or not (
+            self.dacQueue.empty() and self.adcQueue.empty()
+        ):  # Play until the last
+            self.context.handleEventsTimeout(
+                0.1
+            )  # 100 ms timeout prevents blocking forever
 
     def callback(self, transfer):
         """
@@ -80,10 +113,13 @@ class Stream:
             transfer (usb1.USBTransfer): The USB transfer that has completed.
         """
         if transfer.getEndpoint() == self.endpoint_read:
-            self.received_data.extend(transfer.getBuffer())  # Collect received data bytes
-            self.adcQueue.get()  # Unblock the producer (should pop same transfer)
+            if transfer.getStatus() == usb1.TRANSFER_COMPLETED:
+                self.received_data.extend(
+                    transfer.getBuffer()
+                )  # Collect received data bytes
+            self.adcQueue.get_nowait()  # Always drain the queue
         else:
-            self.dacQueue.get()  # Unblock the producer (should pop same transfer)
+            self.dacQueue.get_nowait()  # Always drain the queue
 
     def collect_remaining_adc_data(self):
         """
@@ -92,8 +128,53 @@ class Stream:
         Returns:
             bytearray: The collected ADC data.
         """
-        # Wait for all remaining ADC transfers to complete
         while not self.adcQueue.empty():
-            self.context.handleEvents()
-                        
+            time.sleep(0.01)
+
         return self.received_data
+
+    def write_zeros(self, chunk_bytes: int = 16384):
+        """
+        Sends a zero-filled DAC buffer of `chunk_bytes` bytes and queues one
+        matching ADC read transfer.  Functionally identical to write() but
+        generates the zero payload internally so no DAC Wave is needed.
+
+        Args:
+            chunk_bytes (int): Number of bytes per transfer (must be a multiple
+                of 4).  Defaults to 16384 (16 kB) to match the hardware chunk
+                size used by write().
+        """
+        zeros = bytes(chunk_bytes)
+
+        dac_transfer = self.device.getTransfer()
+        dac_transfer.setBulk(
+            self.endpoint_write, zeros, self.transfer_helper, None, 1000
+        )
+        dac_transfer.submit()
+        self._pending_transfers.append(dac_transfer)
+        self.dacQueue.put(dac_transfer)
+
+        read_transfer = self.device.getTransfer()
+        read_transfer.setBulk(
+            self.endpoint_read, chunk_bytes, self.transfer_helper, None, 1000
+        )
+        read_transfer.submit()
+        self._pending_transfers.append(read_transfer)
+        self.adcQueue.put(read_transfer)
+
+    def collect_adc_exact(self, n_bytes: int) -> bytearray:
+        """
+        Blocks until at least `n_bytes` of ADC data have been collected, then
+        returns exactly `n_bytes` (any excess is discarded).  The stream must
+        have been started with start() and all required write_zeros() calls
+        must have been submitted before calling this.
+
+        Args:
+            n_bytes (int): Exact number of bytes to return.
+
+        Returns:
+            bytearray: Exactly n_bytes of calibrated ADC data.
+        """
+        while len(self.received_data) < n_bytes:
+            time.sleep(0.01)
+        return bytearray(self.received_data[:n_bytes])
