@@ -12,7 +12,8 @@ from PyQa40x.fft_processor import FFTProcessor
 from PyQa40x.sig_proc import SigProc
 from PyQa40x.helpers import *
 from PyQa40x.analyzer_params import AnalyzerParams
-from PyQa40x.bluetooth import BluetoothAudioDevice  
+from PyQa40x.bluetooth import BluetoothAudioDevice
+
 
 class Analyzer:
     def __init__(self):
@@ -27,10 +28,21 @@ class Analyzer:
         self.stream: Stream | None = None
         self.cal_data: dict | None = None
         self.bt_device: BluetoothAudioDevice | None = None
+        self._cleanup_registered = False
 
-    def init(self, sample_rate: int = 48000, max_input_level: int = 0, max_output_level: int = 18, 
-             pre_buf: int = 2048, post_buf: int = 2048, fft_size: int = 16384, window_type: str = 'boxcar',
-             amplitude_unit: str = "dbv", distortion_unit: str = "db", bt_device_name: str = '') -> AnalyzerParams:
+    def init(
+        self,
+        sample_rate: int = 48000,
+        max_input_level: int = 0,
+        max_output_level: int = 18,
+        pre_buf: int = 2048,
+        post_buf: int = 2048,
+        fft_size: int = 16384,
+        window_type: str = "boxcar",
+        amplitude_unit: str = "dbv",
+        distortion_unit: str = "db",
+        bt_device_name: str = "",
+    ) -> AnalyzerParams:
         """
         Initializes the analyzer hardware with the specified parameters.
 
@@ -49,13 +61,24 @@ class Analyzer:
         Returns:
             AnalyzerParams: A class instance containing the hardware and parameter settings.
         """
-        self.params = AnalyzerParams(sample_rate, max_input_level, max_output_level, pre_buf, post_buf, fft_size, window_type)
+        self.params = AnalyzerParams(
+            sample_rate,
+            max_input_level,
+            max_output_level,
+            pre_buf,
+            post_buf,
+            fft_size,
+            window_type,
+        )
         self.context = usb1.USBContext()
+        self.context.open()
 
         # Attempt to open QA402 or QA403 device
-        self.device = self.context.openByVendorIDAndProductID(0x16c0, 0x4e37)  # QA402
+        self.device = self.context.openByVendorIDAndProductID(0x16C0, 0x4E37)  # QA402
         if self.device is None:
-            self.device = self.context.openByVendorIDAndProductID(0x16c0, 0x4e39)  # QA403
+            self.device = self.context.openByVendorIDAndProductID(
+                0x16C0, 0x4E39
+            )  # QA403
             if self.device is None:
                 raise SystemExit("No QA402/QA403 analyzer found")
         self.device.resetDevice()
@@ -80,7 +103,9 @@ class Analyzer:
                 raise SystemExit("Failed to connect to the specified Bluetooth device")
 
         # Register cleanup function to be called on exit
-        atexit.register(self.cleanup)
+        if not self._cleanup_registered:
+            atexit.register(self.cleanup)
+            self._cleanup_registered = True
 
         return self.params
 
@@ -91,10 +116,13 @@ class Analyzer:
         try:
             if self.device:
                 self.device.releaseInterface(0)
-            if self.context:
-                self.context.close()
+                self.device = None
             if self.bt_device:
                 self.bt_device.close()
+                self.bt_device = None
+            if self.context:
+                self.context.close()
+                self.context = None
         except Exception as e:
             print(f"An error occurred during cleanup: {e}")
 
@@ -118,7 +146,9 @@ class Analyzer:
         left_peak = np.max(left_dac_data)
 
         # Get calibration factors for outgoing data
-        cal_dac_left, cal_dac_right = self.control.get_dac_cal(self.cal_data, self.params.max_output_level)
+        cal_dac_left, cal_dac_right = self.control.get_dac_cal(
+            self.cal_data, self.params.max_output_level
+        )
 
         # Convert to dBFS. Note the 3 dB adjustment--dBFS is peak, while dBV is RMS
         dac_dbfs_adjustment = 10 ** -((self.params.max_output_level + 3) / 20)
@@ -132,12 +162,14 @@ class Analyzer:
         right_dac_data_float = right_dac_data.astype(np.float32)
 
         # Interleave the left and right channels
-        interleaved_dac_data = np.empty((left_dac_data_float.size + right_dac_data_float.size,), dtype=np.float32)
+        interleaved_dac_data = np.empty(
+            (left_dac_data_float.size + right_dac_data_float.size,), dtype=np.float32
+        )
         interleaved_dac_data[0::2] = left_dac_data_float
         interleaved_dac_data[1::2] = right_dac_data_float
 
         # Convert to bytes, multiplying by max int value
-        max_int_value = 2 ** 31 - 1
+        max_int_value = 2**31 - 1
         interleaved_dac_data = (interleaved_dac_data * max_int_value).astype(np.int32)
 
         # Pack the data into chunks of 16k bytes
@@ -155,22 +187,24 @@ class Analyzer:
 
         try:
             for i in range(total_chunks):
-                chunk = interleaved_dac_data[i * num_ints_per_chunk:(i + 1) * num_ints_per_chunk]
-                buffer = struct.pack('<%di' % len(chunk), *chunk)
+                chunk = interleaved_dac_data[
+                    i * num_ints_per_chunk : (i + 1) * num_ints_per_chunk
+                ]
+                buffer = struct.pack("<%di" % len(chunk), *chunk)
                 self.stream.write(buffer)
         finally:
             self.stream.stop()
 
         # Collect ADC data. This is bytes
         interleaved_adc_data = self.stream.collect_remaining_adc_data()
-        
+
         # Wait for the Bluetooth thread to finish after processing
         if bt_thread:
             bt_thread.join()
 
         # Convert collected ADC data back to int
         interleaved_adc_data = np.frombuffer(interleaved_adc_data, dtype=np.int32)
-        
+
         # Separate interleaved ADC data into left and right channels. This is int
         left_adc_data_int = interleaved_adc_data[0::2]
         right_adc_data_int = interleaved_adc_data[1::2]
@@ -180,7 +214,9 @@ class Analyzer:
         right_adc_data = right_adc_data_int.astype(np.float64) / max_int_value
 
         # Get calibration factors for incoming data
-        cal_adc_left, cal_adc_right = self.control.get_adc_cal(self.cal_data, self.params.max_input_level)
+        cal_adc_left, cal_adc_right = self.control.get_adc_cal(
+            self.cal_data, self.params.max_input_level
+        )
 
         # Convert from dBFS to dBV. Note the 6 dB factor--the ADC is differential
         adc_dbfs_correction = 10 ** ((self.params.max_input_level - 6) / 20)
@@ -190,7 +226,9 @@ class Analyzer:
         right_adc_data = right_adc_data * cal_adc_right * adc_dbfs_correction
 
         # Ensure the buffer matches the expected shape. Is this needed?
-        expected_shape = (self.params.pre_buf + self.params.fft_size + self.params.post_buf,)
+        expected_shape = (
+            self.params.pre_buf + self.params.fft_size + self.params.post_buf,
+        )
         if left_adc_data.shape[0] != expected_shape[0]:
             left_adc_data = np.resize(left_adc_data, expected_shape)
         if right_adc_data.shape[0] != expected_shape[0]:
@@ -203,11 +241,82 @@ class Analyzer:
         right_wave.set_buffer(right_adc_data)
 
         return left_wave, right_wave
-    
 
     @staticmethod
     def list_audio_devices_by_sample_rate(target_sample_rate: int):
         """List all available audio devices that support a specific sample rate by calling the method from BluetoothAudioDevice."""
         BluetoothAudioDevice.list_audio_devices_by_sample_rate(target_sample_rate)
 
+    def capture(self, total_samples: int) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Captures ``total_samples`` samples from both ADC input channels without
+        playing anything on the DAC outputs.  Unlike ``send_receive()``, this
+        method:
 
+        * Starts the USB stream **once** for the entire capture — no stop/restart
+          between chunks, so no audio is ever lost mid-recording.
+        * Sends zero-filled DAC data (silence) only to satisfy the hardware
+          protocol; DAC output remains at 0 V throughout.
+        * Returns raw calibrated Volt arrays — **no pre/post guard samples are
+          discarded** and the length is exactly ``total_samples``.
+
+        Args:
+            total_samples (int): Number of samples to capture per channel.
+                At 48 kHz, 1 sample = 1/48000 s.  There is no upper limit
+                imposed by this method, but the host must have enough RAM to
+                hold the full recording (2 × total_samples × 8 bytes for
+                float64).
+
+        Returns:
+            tuple[np.ndarray, np.ndarray]: ``(left_volts, right_volts)`` —
+                two float64 arrays each of length ``total_samples``, values
+                in Volts (calibrated, same scale as ``send_receive()``).
+        """
+        chunk_bytes = 16384  # 16 kB per USB transfer
+        bytes_per_stereo_sample = 8  # 2 × int32
+        need_bytes = total_samples * bytes_per_stereo_sample
+
+        # Number of DAC write / ADC read pairs needed to cover need_bytes.
+        # Each pair transfers chunk_bytes ADC bytes.
+        n_chunks = -(-need_bytes // chunk_bytes)  # ceiling division
+
+        max_int_value = 2**31 - 1
+
+        # -- single stream start ------------------------------------------------
+        self.stream.start()
+        try:
+            # Submit all zero-DAC / ADC-read pairs up front so the USB host
+            # controller can pipeline them; no stop/restart in the middle.
+            for _ in range(n_chunks):
+                self.stream.write_zeros(chunk_bytes)
+
+            # Block until we have exactly the bytes we need
+            raw_bytes = self.stream.collect_adc_exact(need_bytes)
+        finally:
+            self.stream.stop()
+        # -- stream stopped -----------------------------------------------------
+
+        # Deserialise interleaved int32 ADC data
+        interleaved = np.frombuffer(raw_bytes, dtype=np.int32)
+
+        left_int = interleaved[0::2]
+        right_int = interleaved[1::2]
+
+        # Trim to exact length (collect_adc_exact already trims, but be safe)
+        left_int = left_int[:total_samples]
+        right_int = right_int[:total_samples]
+
+        # Convert int32 → float64 in the range ±1
+        left_f = left_int.astype(np.float64) / max_int_value
+        right_f = right_int.astype(np.float64) / max_int_value
+
+        # Apply ADC calibration and dBFS → Volts conversion
+        cal_adc_left, cal_adc_right = self.control.get_adc_cal(
+            self.cal_data, self.params.max_input_level
+        )
+        adc_dbfs_correction = 10 ** ((self.params.max_input_level - 6) / 20)
+
+        left_volts = left_f * cal_adc_left * adc_dbfs_correction
+        right_volts = right_f * cal_adc_right * adc_dbfs_correction
+
+        return left_volts, right_volts
