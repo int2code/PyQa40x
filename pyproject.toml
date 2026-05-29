@@ -1,6 +1,6 @@
 [project]
 name = "PyQa40x-i2c"
-description = "A Python library for the QA40x audio analyser (i2c fork)"
+description = "A Python library for the QA40x audio analyser (int2code fork)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
