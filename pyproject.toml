@@ -1,0 +1,27 @@
+[project]
+name = "PyQa40x-i2c"
+description = "A Python library for the QA40x audio analyser (i2c fork)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+maintainers = [
+  {name = "Hubert Stepniewski", email = "hubert.stepniewski@int2code.com"},
+]
+dynamic = ["dependencies", "version", "optional-dependencies"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools_scm]
+write_to = "src/PyQa40x/_version.py"
+
+[tool.setuptools.dynamic.optional-dependencies]
+test = {file = ["requirements-test.txt"]}
+dev = {file = ["requirements-test.txt", "requirements-dev.txt"]}
+
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
