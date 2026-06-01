@@ -1,5 +1,23 @@
 > **Note:** This repository is a fork of the original PyQa40x project and may include custom changes specific to this fork.
 
+### Installation
+ 
+You can install this package via pip:
+```bash
+pip install your-package-name 
+``` 
+
+> **Note for Linux Users:** This package depends on PyAudio. You must install the PortAudio development headers before installing this package, otherwise the build will fail.
+> **Ubuntu/Debian:**
+> ```bash
+> sudo apt-get install portaudio19-dev python3-dev
+> ```
+> **Fedora/CentOS:**
+> ```bash
+> sudo dnf install portaudio-devel python3-devel
+> ```
+
+
 PyQa40x allows you to run Python code to communicate with the QA40x hardware. No intermediate program is needed, as the PyQa40x lib understands how to use the calibration data stored inside the QA40x hardware.
 
 The library is very much in flux, and support might be sporadic. The PyQa40x lib is one of several ways to [use the QA40x hardware](https://github.com/QuantAsylum/QA40x/wiki/QA40x-API). There are now 5 ways to interact with your QA40x hardware:
