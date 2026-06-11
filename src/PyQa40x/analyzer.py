@@ -112,8 +112,21 @@ class Analyzer:
     def cleanup(self):
         """
         Releases the USB device interface and closes the context.
+
+        The stream worker thread **must** be stopped before
+        ``context.close()`` is called.  If the worker is still alive at that
+        point, ``usb1`` blocks in ``threading.wait()`` waiting for its own
+        internal event-handler thread, which in turn is blocked on a libusb
+        mutex held by the worker's ``handleEventsTimeout`` call — a
+        deadlock.  Calling ``stream.stop()`` here (even if it was already
+        called inside ``capture()``\'s ``finally`` block) is safe: if the
+        thread is already dead the join returns immediately; if it is still
+        alive ``stop()`` will force-exit it via ``_force_stop``.
         """
         try:
+            if self.stream:
+                self.stream.stop()
+                self.stream = None
             if self.device:
                 self.device.releaseInterface(0)
                 self.device = None

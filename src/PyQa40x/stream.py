@@ -45,12 +45,16 @@ class Stream:
         self.thread = None
         self.running = False
         self._pending_transfers = []  # track all submitted transfers for cancellation
+        self._force_stop = (
+            threading.Event()
+        )  # raised to break the worker out of stuck queues
 
     def start(self):
         """
         Starts the streaming and spawns the worker thread.
         """
-        self.thread = threading.Thread(target=self.worker)
+        self._force_stop.clear()
+        self.thread = threading.Thread(target=self.worker, daemon=True)
         self.running = True
         self.thread.start()
         self.received_data = bytearray()
@@ -59,6 +63,14 @@ class Stream:
     def stop(self):
         """
         Stops the streaming and ends the worker thread.
+
+        Sets ``running`` to False and cancels in-flight USB transfers so their
+        callbacks fire and drain the queues, which allows the worker loop to
+        exit naturally.  If the worker has not exited within 5 seconds (e.g.
+        because a USB cancellation is slow), ``_force_stop`` is set so the
+        worker breaks unconditionally after its current
+        ``handleEventsTimeout(0.1)`` call (≤ 100 ms), and we give it one
+        further second to join before proceeding.
         """
         self.running = False
         # Cancel any in-flight transfers so their callbacks fire and drain the queues,
@@ -69,7 +81,13 @@ class Stream:
             except Exception:
                 pass
         self._pending_transfers.clear()
-        self.thread.join(timeout=5.0)
+        if self.thread is not None and self.thread.is_alive():
+            self.thread.join(timeout=5.0)
+            if self.thread.is_alive():
+                # Worker is stuck (slow USB cancellation).  Force it out so
+                # context.close() does not deadlock.
+                self._force_stop.set()
+                self.thread.join(timeout=1.0)
         self.registers.write(8, 0x00)  # Stop streaming
 
     def write(self, buffer):
@@ -97,10 +115,20 @@ class Stream:
     def worker(self):
         """
         Event loop for the asynchronous transfers.
+
+        Runs until *both* conditions are true:
+        * ``running`` is False (``stop()`` has been called), and
+        * both USB queues are empty (all callbacks have fired).
+
+        An early exit is also triggered by ``_force_stop`` (set by ``stop()``
+        when the normal join times out) so that ``context.close()`` is never
+        called while this thread is still inside ``handleEventsTimeout``.
         """
         while self.running or not (
             self.dacQueue.empty() and self.adcQueue.empty()
         ):  # Play until the last
+            if self._force_stop.is_set():
+                break
             self.context.handleEventsTimeout(
                 0.1
             )  # 100 ms timeout prevents blocking forever
