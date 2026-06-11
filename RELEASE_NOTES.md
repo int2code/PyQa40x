@@ -1,3 +1,7 @@
+### 0.1.2
+
+[PATCH] Fix usb teardown deadlock.
+
 ### 0.1.1
 
 [PATCH] Fix missing dependency.
