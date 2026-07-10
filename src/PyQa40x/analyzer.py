@@ -257,8 +257,50 @@ class Analyzer:
 
     @staticmethod
     def list_audio_devices_by_sample_rate(target_sample_rate: int):
-        """List all available audio devices that support a specific sample rate by calling the method from BluetoothAudioDevice."""
+        """
+        List all available audio devices that support a specific sample rate
+        by calling the method from BluetoothAudioDevice.
+        """
         BluetoothAudioDevice.list_audio_devices_by_sample_rate(target_sample_rate)
+
+    def _convert_adc_bytes_to_volts(
+        self, raw_bytes: bytearray, n_samples: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Convert interleaved int32 ADC bytes to calibrated Volt arrays.
+
+        Args:
+            raw_bytes (bytes): Interleaved little-endian int32 stereo ADC data.
+            n_samples (int): Samples per channel to return.
+
+        Returns:
+            tuple[np.ndarray, np.ndarray]: (left_volts, right_volts), float64.
+        """
+        # Reads the raw bytes and treat every 4 bytes as one signed 32‑bit integer
+        # [L0, R0, L1, R1, L2, R2, …]
+        interleaved = np.frombuffer(raw_bytes, dtype=np.int32)
+
+        # Split interleaved int32 array into left and right channels
+        left_int = interleaved[0::2][:n_samples]
+        right_int = interleaved[1::2][:n_samples]
+
+        # Convert int32 → float64 and normalise to range +-1
+        max_int_value = 2**31 - 1
+        left_f = left_int.astype(np.float64) / max_int_value
+        right_f = right_int.astype(np.float64) / max_int_value
+
+        # Factor for computing the voltage that corresponds to digital full scale
+        dbfs_correction = 10 ** ((self.params.max_input_level - 6) / 20)
+        # Stored QA40x calibration factors for the current input level.
+        cal_adc_left, cal_adc_right = self.control.get_adc_cal(
+            self.cal_data, self.params.max_input_level
+        )
+
+        # Apply ADC calibration and dBFS → Volts conversion
+        left_volts = left_f * cal_adc_left * dbfs_correction
+        right_volts = right_f * cal_adc_right * dbfs_correction
+
+        return left_volts, right_volts
 
     def capture(self, total_samples: int) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -293,8 +335,6 @@ class Analyzer:
         # Each pair transfers chunk_bytes ADC bytes.
         n_chunks = -(-need_bytes // chunk_bytes)  # ceiling division
 
-        max_int_value = 2**31 - 1
-
         # -- single stream start ------------------------------------------------
         self.stream.start()
         try:
@@ -307,29 +347,5 @@ class Analyzer:
             raw_bytes = self.stream.collect_adc_exact(need_bytes)
         finally:
             self.stream.stop()
-        # -- stream stopped -----------------------------------------------------
 
-        # Deserialise interleaved int32 ADC data
-        interleaved = np.frombuffer(raw_bytes, dtype=np.int32)
-
-        left_int = interleaved[0::2]
-        right_int = interleaved[1::2]
-
-        # Trim to exact length (collect_adc_exact already trims, but be safe)
-        left_int = left_int[:total_samples]
-        right_int = right_int[:total_samples]
-
-        # Convert int32 → float64 in the range ±1
-        left_f = left_int.astype(np.float64) / max_int_value
-        right_f = right_int.astype(np.float64) / max_int_value
-
-        # Apply ADC calibration and dBFS → Volts conversion
-        cal_adc_left, cal_adc_right = self.control.get_adc_cal(
-            self.cal_data, self.params.max_input_level
-        )
-        adc_dbfs_correction = 10 ** ((self.params.max_input_level - 6) / 20)
-
-        left_volts = left_f * cal_adc_left * adc_dbfs_correction
-        right_volts = right_f * cal_adc_right * adc_dbfs_correction
-
-        return left_volts, right_volts
+        return self._convert_adc_bytes_to_volts(raw_bytes, total_samples)
