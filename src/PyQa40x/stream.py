@@ -4,6 +4,8 @@ import usb1
 import logging
 from typing import Callable
 
+from PyQa40x.registers import Registers
+
 logger = logging.getLogger(__name__)
 
 
@@ -25,15 +27,23 @@ class Stream:
     """
 
     TRANSFER_TIMEOUT_MS = 1000  # Timeout for USB transfers in milliseconds
+    TRANSFER_BYTES = 16384  # 16 kB per USB bulk transfer (hardware chunk size)
+    # cap on unread ADC data before overflow
+    MAX_BUFFERED_BYTES = 256 * 1024 * 1024
 
-    def __init__(self, context, device, registers):
+    def __init__(
+        self,
+        context: usb1.USBContext,
+        device: usb1.USBDeviceHandle,
+        registers: Registers,
+    ) -> None:
         """
-        Initializes the Stream class.
+        Initialize the Stream.
 
         Args:
             context (usb1.USBContext): The USB context.
             device (usb1.USBDeviceHandle): The USB device handle.
-            registers (Registers): An instance of the Registers class.
+            registers (Registers): The Registers instance for control writes.
         """
         self.context = context
         self.device = device
@@ -57,26 +67,31 @@ class Stream:
             usb1.TRANSFER_OVERFLOW,
         ):
             self.transfer_helper.setEventCallback(status, self.callback)
-        # self.received_data = bytearray()  # Collection of received data bytes
-        self.thread = None
+        self.thread: threading.Thread | None = None
         self.running = False
-        self._pending_transfers = []  # track all submitted transfers for cancellation
-        self._force_stop = (
-            threading.Event()
-        )  # raised to break the worker out of stuck queues
+        # In-flight transfers, keyed by identity; pruned in callback, bulk-cancelled in stop.
+        self._pending_transfers: set = set()
+        # raised to break the worker out of stuck queues
+        self._force_stop = threading.Event()
         self._transfer_lock = threading.Lock()  # protects _pending_transfers
-        self._adc_data = queue.Queue()  # Queue for received ADC data in chunks
-        self._adc_data_carry = (
-            bytearray()
-        )  # Buffer to carry ADC data not divided into chunks
-        self._overflow_error = None  # latched AdcOverflowError, raised by consume_adc
-        self._chunks_limit = 16384  # ~256 MB at 16 KB/chunk
+        self._epoch = 0  # session counter; stale-session callbacks are ignored
+        self._adc_data = queue.Queue()  # received ADC data, one chunk per item
+        self._adc_data_carry = bytearray()  # leftover ADC bytes between consume_adc calls
+        # latched, raised by consume_adc
+        self._overflow_error: AdcOverflowError | None = None
+        self._max_queued_chunks = self.MAX_BUFFERED_BYTES // self.TRANSFER_BYTES
 
-    def start(self):
+    @property
+    def overflow_error(self) -> "AdcOverflowError | None":
+        """Latched ADC overflow error, or None if the buffer never overran."""
+        return self._overflow_error
+
+    def start(self) -> None:
         """
-        Starts the streaming and spawns the worker thread.
+        Start streaming and spawn the worker thread.
         """
         self._force_stop.clear()
+        self._epoch += 1  # new session; callbacks from prior sessions are ignored
         self.thread = threading.Thread(target=self.worker, daemon=True)
         self.running = True
         self.thread.start()
@@ -85,9 +100,9 @@ class Stream:
         self._overflow_error = None  # Reset the overflow error
         self.registers.write(8, 0x05)  # Start streaming
 
-    def stop(self):
+    def stop(self) -> None:
         """
-        Stops the streaming and ends the worker thread.
+        Stop streaming and end the worker thread.
 
         Sets ``running`` to False and cancels in-flight USB transfers so their
         callbacks fire and drain the queues, which allows the worker loop to
@@ -118,43 +133,7 @@ class Stream:
                 self.thread.join(timeout=1.0)
         self.registers.write(8, 0x00)  # Stop streaming
 
-    def write(self, buffer):
-        """
-        Adds a buffer to the playback queue.
-
-        Args:
-            buffer (bytes): The data buffer to be written.
-        """
-        transfer = self.device.getTransfer()
-        transfer.setBulk(
-            self.endpoint_write,
-            buffer,
-            self.transfer_helper,
-            None,
-            self.TRANSFER_TIMEOUT_MS,
-        )
-        transfer.submit()  # Asynchronous transfer
-        self._pending_transfers.append(transfer)
-        self.dacQueue.put(
-            transfer
-        )  # It doesn't matter what we put in here, queue is just to track the number of pending transfers
-
-        # Submit a USB bulk transfer to read
-        read_transfer = self.device.getTransfer()
-        read_transfer.setBulk(
-            self.endpoint_read,
-            16384,
-            self.transfer_helper,
-            None,
-            self.TRANSFER_TIMEOUT_MS,
-        )
-        read_transfer.submit()  # Asynchronous transfer
-        self._pending_transfers.append(read_transfer)
-        self.adcQueue.put(
-            read_transfer
-        )  # It doesn't matter what we put in here, queue is just to track the number of pending transfers
-
-    def worker(self):
+    def worker(self) -> None:
         """
         Event loop for the asynchronous transfers.
 
@@ -171,22 +150,26 @@ class Stream:
         ):  # Play until the last
             if self._force_stop.is_set():
                 break
-            self.context.handleEventsTimeout(
-                0.1
-            )  # 100 ms timeout prevents blocking forever
+            # 100 ms timeout prevents blocking forever
+            self.context.handleEventsTimeout(0.1)
 
-    def callback(self, transfer):
+    def callback(self, transfer: usb1.USBTransfer) -> None:
         """
-        Callback of the worker thread to handle completed transfers.
+        Handle a completed transfer (runs on the worker thread).
+
+        On a completed ADC read, buffer the bytes; if the receive queue passes
+        its limit, latch an AdcOverflowError and stop so consume_adc can raise it.
 
         Args:
             transfer (usb1.USBTransfer): The USB transfer that has completed.
         """
+        current = transfer.getUserData() == self._epoch  # ignore stale-session data
         if transfer.getEndpoint() == self.endpoint_read:
-            if transfer.getStatus() == usb1.TRANSFER_COMPLETED:
+            if current and transfer.getStatus() == usb1.TRANSFER_COMPLETED:
                 if self._overflow_error is None:
-                    self._adc_data.put(transfer.getBuffer())
-                if self._adc_data.qsize() > self._chunks_limit:
+                    # Copy: the transfer buffer is freed once we prune the transfer.
+                    self._adc_data.put(bytes(transfer.getBuffer()))
+                if self._adc_data.qsize() > self._max_queued_chunks:
                     self._overflow_error = AdcOverflowError(
                         "ADC receive queue exceeded high-water mark "
                         f"({self._adc_data.qsize()} chunks); consumer not "
@@ -198,70 +181,61 @@ class Stream:
         else:
             self.dacQueue.get_nowait()  # Always drain the queue
 
-    def write_zeros(self, chunk_bytes: int = 16384):
-        """
-        Sends a zero-filled DAC buffer of `chunk_bytes` bytes and queues one
-        matching ADC read transfer.  Functionally identical to write() but
-        generates the zero payload internally so no DAC Wave is needed.
+        # Prune this finished transfer so _pending_transfers stays bounded during
+        # a long capture; discard() is a no-op if stop() already cleared it.
+        with self._transfer_lock:
+            self._pending_transfers.discard(transfer)
 
-        Args:
-            chunk_bytes (int): Number of bytes per transfer (must be a multiple
-                of 4).  Defaults to 16384 (16 kB) to match the hardware chunk
-                size used by write().
-        """
-        zeros = bytes(chunk_bytes)
-
+    def write(self, buffer: bytes) -> None:
+        """Submit one DAC playback buffer and one matching ADC read transfer."""
         with self._transfer_lock:
             if not self.running:
-                raise RuntimeError("Stream is not running; call start() first.")
+                raise RuntimeError(
+                    "Stream is not running; call start() first.")
+            dac = self.device.getTransfer()
+            dac.setBulk(self.endpoint_write, buffer, self.transfer_helper,
+                        self._epoch, self.TRANSFER_TIMEOUT_MS)
+            dac.submit()
+            self._pending_transfers.add(dac)
+            read = self.device.getTransfer()
+            read.setBulk(self.endpoint_read, len(buffer), self.transfer_helper,
+                         self._epoch, self.TRANSFER_TIMEOUT_MS)
+            read.submit()
+            self._pending_transfers.add(read)
+        self.dacQueue.put(dac)
+        self.adcQueue.put(read)
 
-            dac_transfer = self.device.getTransfer()
-            dac_transfer.setBulk(
-                self.endpoint_write,
-                zeros,
-                self.transfer_helper,
-                None,
-                self.TRANSFER_TIMEOUT_MS,
-            )
-            dac_transfer.submit()
-            self._pending_transfers.append(dac_transfer)
-            self.dacQueue.put(dac_transfer)
-
-            read_transfer = self.device.getTransfer()
-            read_transfer.setBulk(
-                self.endpoint_read,
-                chunk_bytes,
-                self.transfer_helper,
-                None,
-                self.TRANSFER_TIMEOUT_MS,
-            )
-            read_transfer.submit()
-            self._pending_transfers.append(read_transfer)
-            self.adcQueue.put(read_transfer)
+    def write_zeros(self, chunk_bytes: int = TRANSFER_BYTES) -> None:
+        """Feed the ADC pipeline with a zero DAC buffer (continuous capture)."""
+        self.write(bytes(chunk_bytes))
 
     def consume_adc(
         self,
         need_bytes: int,
-        wait_for_needed: Callable[[], bool] | None = None,
+        should_keep_waiting: Callable[[], bool] | None = None,
         poll_s: float = 0.005,
     ) -> bytearray:
         """
-        Blocks until at least `need_bytes` of ADC data are available, then removes
-        and returns exactly that many bytes from the front of the receive buffer.
-
+        Block until `need_bytes` of ADC data are available, then remove and
+        return exactly that many bytes from the front of the receive buffer.
 
         Args:
             need_bytes (int): Number of bytes to consume.
-            wait_for_needed (bool): Optional flag; when False, stop waiting and return what is available.
+            should_keep_waiting (Callable[[], bool] | None): Polled each iteration;
+                when it returns False, stop waiting and return what is available.
             poll_s (float): Poll interval in seconds.
 
         Returns:
             bytearray: Up to `need_bytes` of ADC data (fewer only on early stop).
+
+        Raises:
+            AdcOverflowError: If the receive buffer exceeded its limit because
+                captured data was not read fast enough.
         """
         while len(self._adc_data_carry) < need_bytes:
             if self._overflow_error is not None:
                 raise self._overflow_error
-            if wait_for_needed is not None and not wait_for_needed():
+            if should_keep_waiting is not None and not should_keep_waiting():
                 break
             if not self.running and self._adc_data.empty():
                 break  # stream stopped and no more data will arrive, return what we have
