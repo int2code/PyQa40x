@@ -1,8 +1,12 @@
+import threading
+import logging
+from time import time
+from typing import Callable
+
 import numpy as np
 import usb1  # pip install libusb1
 import struct
 import atexit
-import scipy.signal  # pip install scipy
 
 from PyQa40x.registers import Registers
 from PyQa40x.control import Control
@@ -14,8 +18,13 @@ from PyQa40x.helpers import *
 from PyQa40x.analyzer_params import AnalyzerParams
 from PyQa40x.bluetooth import BluetoothAudioDevice
 
+logger = logging.getLogger(__name__)
+
 
 class Analyzer:
+
+    CAPTURE_CHUNK_BYTES = 16384  # 16 kB per USB transfer
+
     def __init__(self):
         """
         Initializes the Analyzer class.
@@ -29,6 +38,9 @@ class Analyzer:
         self.cal_data: dict | None = None
         self.bt_device: BluetoothAudioDevice | None = None
         self._cleanup_registered = False
+        self._capturing = False
+        self._dac_writer = None  # threading.Thread, set in start_capture()
+        self._dac_writer_error = None  # Exception raised in DAC writer thread, if any
 
     def init(
         self,
@@ -302,6 +314,80 @@ class Analyzer:
 
         return left_volts, right_volts
 
+    def start_capture(self) -> None:
+        """
+        Starts a continuous capture of ADC data in a background thread.
+        The captured data can be retrieved later using the `read_capture` method.
+        """
+        if self._capturing:
+            raise RuntimeError("Capture is already in progress.")
+
+        self._capturing = True
+        self._dac_writer_error = None
+        self.stream.start()
+        self._dac_writer = threading.Thread(
+            target=self._dac_writer_loop, name="qa40x-dac-writer-thread", daemon=True
+        )
+        self._dac_writer.start()
+
+    def _dac_writer_loop(self):
+        """Continuously submit zero-DAC / ADC-read transfer pairs while capturing."""
+        while self._capturing and self.stream.running:
+            try:
+                self.stream.write_zeros(self.CAPTURE_CHUNK_BYTES)
+            except Exception as exc:  # pylint: disable=broad-except
+                if self._capturing and self.stream.running:
+                    self._dac_writer_error = exc
+                    self._capturing = False
+                    logger.error(
+                        "DAC writer encountered an error. Stopping capture.",
+                        exc_info=exc,
+                    )
+                # If capturing is stopped, racing with stop() is expected. Just exit the loop.
+                break
+
+    def read_capture(self, n_samples):
+        """
+        Return the next `n_samples` samples per channel as Volt arrays.
+
+        Blocks until the samples are available.  Consecutive calls return
+        contiguous audio (no gap) because the stream is never stopped between
+        reads. Returns fewer than `n_samples` only if the capture is stopping.
+
+        Args:
+            n_samples (int): Samples per channel to return.
+
+        Returns:
+            tuple[np.ndarray, np.ndarray]: (left_volts, right_volts), float64.
+        """
+        if self._dac_writer_error is not None:
+            raise RuntimeError(
+                "DAC writer thread encountered an error during capture."
+            ) from self._dac_writer_error
+
+        need_bytes = n_samples * 8  # 2 channels x int32
+
+        raw = self.stream.consume_adc(
+            need_bytes, wait_for_needed=lambda: self._capturing
+        )
+        got_samples = len(raw) // 8
+        return self._convert_adc_bytes_to_volts(bytes(raw), got_samples)
+
+    def stop_capture(self) -> None:
+        """
+        Stop the continuous capture: end the feeder thread and stop the stream.
+
+        Order matters: clearing `_capturing` and stopping the stream releases a
+        dac writer blocked on the dacQueue (stop() cancels transfers and drains the
+        queue), after which the dac writer observes `_capturing == False` and exits.
+        """
+        if not self._capturing:
+            return
+        self._capturing = False
+        self.stream.stop()
+        if self._dac_writer is not None:
+            self._dac_writer.join(timeout=5.0)
+
     def capture(self, total_samples: int) -> tuple[np.ndarray, np.ndarray]:
         """
         Captures ``total_samples`` samples from both ADC input channels without
@@ -327,25 +413,10 @@ class Analyzer:
                 two float64 arrays each of length ``total_samples``, values
                 in Volts (calibrated, same scale as ``send_receive()``).
         """
-        chunk_bytes = 16384  # 16 kB per USB transfer
-        bytes_per_stereo_sample = 8  # 2 × int32
-        need_bytes = total_samples * bytes_per_stereo_sample
-
-        # Number of DAC write / ADC read pairs needed to cover need_bytes.
-        # Each pair transfers chunk_bytes ADC bytes.
-        n_chunks = -(-need_bytes // chunk_bytes)  # ceiling division
-
-        # -- single stream start ------------------------------------------------
-        self.stream.start()
+        # A fixed-length capture is just a continuous capture read once: start
+        # the gapless stream, read exactly total_samples, then stop.
+        self.start_capture()
         try:
-            # Submit all zero-DAC / ADC-read pairs up front so the USB host
-            # controller can pipeline them; no stop/restart in the middle.
-            for _ in range(n_chunks):
-                self.stream.write_zeros(chunk_bytes)
-
-            # Block until we have exactly the bytes we need
-            raw_bytes = self.stream.collect_adc_exact(need_bytes)
+            return self.read_capture(total_samples)
         finally:
-            self.stream.stop()
-
-        return self._convert_adc_bytes_to_volts(raw_bytes, total_samples)
+            self.stop_capture()
