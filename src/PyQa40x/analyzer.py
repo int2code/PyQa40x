@@ -3,15 +3,11 @@ import logging
 
 import numpy as np
 import usb1  # pip install libusb1
-import struct
 import atexit
 
 from PyQa40x.registers import Registers
 from PyQa40x.control import Control
 from PyQa40x.stream import Stream
-from PyQa40x.wave_sine import Wave
-from PyQa40x.fft_processor import FFTProcessor
-from PyQa40x.sig_proc import SigProc
 from PyQa40x.helpers import *
 from PyQa40x.analyzer_params import AnalyzerParams
 from PyQa40x.bluetooth import BluetoothAudioDevice
@@ -84,11 +80,11 @@ class Analyzer:
         self.context.open()
 
         # Attempt to open QA402 or QA403 device
-        self.device = self.context.openByVendorIDAndProductID(
-            0x16C0, 0x4E37)  # QA402
+        self.device = self.context.openByVendorIDAndProductID(0x16C0, 0x4E37)  # QA402
         if self.device is None:
             self.device = self.context.openByVendorIDAndProductID(
-                0x16C0, 0x4E39)  # QA403
+                0x16C0, 0x4E39
+            )  # QA403
             if self.device is None:
                 raise SystemExit("No QA402/QA403 analyzer found")
         self.device.resetDevice()
@@ -110,8 +106,7 @@ class Analyzer:
         if bt_device_name:
             self.bt_device = BluetoothAudioDevice(bt_device_name, sample_rate)
             if self.bt_device.device_index is None:
-                raise SystemExit(
-                    "Failed to connect to the specified Bluetooth device")
+                raise SystemExit("Failed to connect to the specified Bluetooth device")
 
         # Register cleanup function to be called on exit
         if not self._cleanup_registered:
@@ -156,8 +151,7 @@ class Analyzer:
         List all available audio devices that support a specific sample rate
         by calling the method from BluetoothAudioDevice.
         """
-        BluetoothAudioDevice.list_audio_devices_by_sample_rate(
-            target_sample_rate)
+        BluetoothAudioDevice.list_audio_devices_by_sample_rate(target_sample_rate)
 
     def _convert_adc_bytes_to_volts(
         self, raw_bytes: bytearray, n_samples: int
@@ -224,8 +218,7 @@ class Analyzer:
                 # expect to run is recorded in the post-loop reconciliation below.
                 if self._capturing and self.stream.running:
                     self._dac_writer_error = exc
-                    logger.error(
-                        "DAC writer failed; stopping capture.", exc_info=exc)
+                    logger.error("DAC writer failed; stopping capture.", exc_info=exc)
                 break
 
         # If the loop ended but we never asked to stop, the stream halted
@@ -264,7 +257,8 @@ class Analyzer:
         need_bytes = n_samples * 8  # 2 channels x int32
 
         raw = self.stream.consume_adc(
-            need_bytes, should_keep_waiting=lambda: self._capturing)
+            need_bytes, should_keep_waiting=lambda: self._capturing
+        )
         got_samples = len(raw) // 8
         return self._convert_adc_bytes_to_volts(raw, got_samples)
 
