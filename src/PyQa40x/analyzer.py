@@ -1,21 +1,24 @@
+import threading
+import logging
+
 import numpy as np
 import usb1  # pip install libusb1
-import struct
 import atexit
-import scipy.signal  # pip install scipy
 
 from PyQa40x.registers import Registers
 from PyQa40x.control import Control
 from PyQa40x.stream import Stream
-from PyQa40x.wave_sine import Wave
-from PyQa40x.fft_processor import FFTProcessor
-from PyQa40x.sig_proc import SigProc
 from PyQa40x.helpers import *
 from PyQa40x.analyzer_params import AnalyzerParams
 from PyQa40x.bluetooth import BluetoothAudioDevice
 
+logger = logging.getLogger(__name__)
+
 
 class Analyzer:
+
+    CAPTURE_CHUNK_BYTES = Stream.TRANSFER_BYTES  # bytes per USB transfer
+
     def __init__(self):
         """
         Initializes the Analyzer class.
@@ -29,6 +32,9 @@ class Analyzer:
         self.cal_data: dict | None = None
         self.bt_device: BluetoothAudioDevice | None = None
         self._cleanup_registered = False
+        self._capturing: bool = False
+        self._dac_writer: threading.Thread | None = None  # set in start_capture()
+        self._dac_writer_error: Exception | None = None  # error from DAC writer thread
 
     def init(
         self,
@@ -139,126 +145,137 @@ class Analyzer:
         except Exception as e:
             print(f"An error occurred during cleanup: {e}")
 
-    def send_receive(self, left_wave: Wave, right_wave: Wave) -> tuple[Wave, Wave]:
+    @staticmethod
+    def list_audio_devices_by_sample_rate(target_sample_rate: int):
         """
-        Sends DAC data to the device and receives ADC data.
+        List all available audio devices that support a specific sample rate
+        by calling the method from BluetoothAudioDevice.
+        """
+        BluetoothAudioDevice.list_audio_devices_by_sample_rate(target_sample_rate)
+
+    def _convert_adc_bytes_to_volts(
+        self, raw_bytes: bytearray, n_samples: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Convert interleaved int32 ADC bytes to calibrated Volt arrays.
 
         Args:
-            left_wave (Wave): Wave instance with left channel DAC data.
-            right_wave (Wave): Wave instance with right channel DAC data.
+            raw_bytes (bytearray): Interleaved little-endian int32 stereo ADC data.
+            n_samples (int): Samples per channel to return.
 
         Returns:
-            tuple[Wave, Wave]: Tuple containing Wave instances with left and right channel ADC data.
+            tuple[np.ndarray, np.ndarray]: (left_volts, right_volts), float64.
         """
-        left_dac_data = left_wave.get_buffer()
-        right_dac_data = right_wave.get_buffer()
+        # Reads the raw bytes and treat every 4 bytes as one signed 32‑bit integer
+        # [L0, R0, L1, R1, L2, R2, …]
+        interleaved = np.frombuffer(raw_bytes, dtype=np.int32)
 
-        # On QA402 and QA403, outputs need to be swapped
-        left_dac_data, right_dac_data = right_dac_data, left_dac_data
+        # Split interleaved int32 array into left and right channels
+        left_int = interleaved[0::2][:n_samples]
+        right_int = interleaved[1::2][:n_samples]
 
-        left_peak = np.max(left_dac_data)
-
-        # Get calibration factors for outgoing data
-        cal_dac_left, cal_dac_right = self.control.get_dac_cal(
-            self.cal_data, self.params.max_output_level
-        )
-
-        # Convert to dBFS. Note the 3 dB adjustment--dBFS is peak, while dBV is RMS
-        dac_dbfs_adjustment = 10 ** -((self.params.max_output_level + 3) / 20)
-
-        # Apply calibration and dBFS scaling
-        left_dac_data = left_dac_data * dac_dbfs_adjustment * cal_dac_left
-        right_dac_data = right_dac_data * dac_dbfs_adjustment * cal_dac_right
-
-        # Convert incoming doubles to float
-        left_dac_data_float = left_dac_data.astype(np.float32)
-        right_dac_data_float = right_dac_data.astype(np.float32)
-
-        # Interleave the left and right channels
-        interleaved_dac_data = np.empty(
-            (left_dac_data_float.size + right_dac_data_float.size,), dtype=np.float32
-        )
-        interleaved_dac_data[0::2] = left_dac_data_float
-        interleaved_dac_data[1::2] = right_dac_data_float
-
-        # Convert to bytes, multiplying by max int value
+        # Convert int32 → float64 and normalise to range +-1
         max_int_value = 2**31 - 1
-        interleaved_dac_data = (interleaved_dac_data * max_int_value).astype(np.int32)
+        left_f = left_int.astype(np.float64) / max_int_value
+        right_f = right_int.astype(np.float64) / max_int_value
 
-        # Pack the data into chunks of 16k bytes
-        chunk_size = 16384  # 16k bytes
-        num_ints_per_chunk = chunk_size // 4  # 32-bit ints, so 4 bytes per int
-        total_chunks = len(interleaved_dac_data) // num_ints_per_chunk
-
-        self.stream.start()
-
-        # Play wave on Bluetooth if available
-        bt_thread = None
-        if self.bt_device:
-            # Play both left and right waves on Bluetooth
-            bt_thread = self.bt_device.play_wave_background(left_wave, right_wave)
-
-        try:
-            for i in range(total_chunks):
-                chunk = interleaved_dac_data[
-                    i * num_ints_per_chunk : (i + 1) * num_ints_per_chunk
-                ]
-                buffer = struct.pack("<%di" % len(chunk), *chunk)
-                self.stream.write(buffer)
-        finally:
-            self.stream.stop()
-
-        # Collect ADC data. This is bytes
-        interleaved_adc_data = self.stream.collect_remaining_adc_data()
-
-        # Wait for the Bluetooth thread to finish after processing
-        if bt_thread:
-            bt_thread.join()
-
-        # Convert collected ADC data back to int
-        interleaved_adc_data = np.frombuffer(interleaved_adc_data, dtype=np.int32)
-
-        # Separate interleaved ADC data into left and right channels. This is int
-        left_adc_data_int = interleaved_adc_data[0::2]
-        right_adc_data_int = interleaved_adc_data[1::2]
-
-        # Convert left and right channels back to double
-        left_adc_data = left_adc_data_int.astype(np.float64) / max_int_value
-        right_adc_data = right_adc_data_int.astype(np.float64) / max_int_value
-
-        # Get calibration factors for incoming data
+        # Factor for computing the voltage that corresponds to digital full scale
+        dbfs_correction = 10 ** ((self.params.max_input_level - 6) / 20)
+        # Stored QA40x calibration factors for the current input level.
         cal_adc_left, cal_adc_right = self.control.get_adc_cal(
             self.cal_data, self.params.max_input_level
         )
 
-        # Convert from dBFS to dBV. Note the 6 dB factor--the ADC is differential
-        adc_dbfs_correction = 10 ** ((self.params.max_input_level - 6) / 20)
+        # Apply ADC calibration and dBFS → Volts conversion
+        left_volts = left_f * cal_adc_left * dbfs_correction
+        right_volts = right_f * cal_adc_right * dbfs_correction
 
-        # Apply calibration and dBFS scaling
-        left_adc_data = left_adc_data * cal_adc_left * adc_dbfs_correction
-        right_adc_data = right_adc_data * cal_adc_right * adc_dbfs_correction
+        return left_volts, right_volts
 
-        # Ensure the buffer matches the expected shape. Is this needed?
-        expected_shape = (
-            self.params.pre_buf + self.params.fft_size + self.params.post_buf,
+    def start_capture(self) -> None:
+        """
+        Starts a continuous capture of ADC data in a background thread.
+        The captured data can be retrieved later using the `read_capture` method.
+        """
+        if self._capturing:
+            raise RuntimeError("Capture is already in progress.")
+
+        self._capturing = True
+        self._dac_writer_error = None
+        self.stream.start()
+        self._dac_writer = threading.Thread(
+            target=self._dac_writer_loop, name="qa40x-dac-writer-thread", daemon=True
         )
-        if left_adc_data.shape[0] != expected_shape[0]:
-            left_adc_data = np.resize(left_adc_data, expected_shape)
-        if right_adc_data.shape[0] != expected_shape[0]:
-            right_adc_data = np.resize(right_adc_data, expected_shape)
+        self._dac_writer.start()
 
-        # Create instances of Wave with the full buffers
-        left_wave = Wave(self.params)
-        right_wave = Wave(self.params)
-        left_wave.set_buffer(left_adc_data)
-        right_wave.set_buffer(right_adc_data)
+    def _dac_writer_loop(self) -> None:
+        """Continuously submit zero-DAC / ADC-read transfer pairs while capturing."""
+        while self._capturing and self.stream.running:
+            try:
+                self.stream.write_zeros(self.CAPTURE_CHUNK_BYTES)
+            except Exception as exc:  # pylint: disable=broad-except
+                # Racing with stop() is expected; a real failure while we still
+                # expect to run is recorded in the post-loop reconciliation below.
+                if self._capturing and self.stream.running:
+                    self._dac_writer_error = exc
+                    logger.error("DAC writer failed; stopping capture.", exc_info=exc)
+                break
 
-        return left_wave, right_wave
+        # If the loop ended but we never asked to stop, the stream halted
+        # underneath us (error or ADC overflow): record it and clear _capturing so
+        # the analyzer isn't wedged "capturing" behind a dead writer thread.
+        if self._capturing:
+            self._capturing = False
+            if self._dac_writer_error is None:
+                self._dac_writer_error = self.stream.overflow_error or RuntimeError(
+                    "Stream stopped unexpectedly during capture."
+                )
 
-    @staticmethod
-    def list_audio_devices_by_sample_rate(target_sample_rate: int):
-        """List all available audio devices that support a specific sample rate by calling the method from BluetoothAudioDevice."""
-        BluetoothAudioDevice.list_audio_devices_by_sample_rate(target_sample_rate)
+    def read_capture(self, n_samples: int) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Return the next `n_samples` samples per channel as Volt arrays.
+
+        Blocks until the samples are available. Consecutive calls return
+        contiguous audio (no gap) because the stream is never stopped between
+        reads. Returns fewer than `n_samples` only if the capture is stopping.
+
+        Args:
+            n_samples (int): Samples per channel to return.
+
+        Returns:
+            tuple[np.ndarray, np.ndarray]: (left_volts, right_volts), float64.
+
+        Raises:
+            RuntimeError: If the DAC writer thread failed during capture.
+            AdcOverflowError: If capture data was not read fast enough.
+        """
+        if self._dac_writer_error is not None:
+            raise RuntimeError(
+                "DAC writer thread encountered an error during capture."
+            ) from self._dac_writer_error
+
+        need_bytes = n_samples * 8  # 2 channels x int32
+
+        raw = self.stream.consume_adc(
+            need_bytes, should_keep_waiting=lambda: self._capturing
+        )
+        got_samples = len(raw) // 8
+        return self._convert_adc_bytes_to_volts(raw, got_samples)
+
+    def stop_capture(self) -> None:
+        """
+        Stop the continuous capture: end the feeder thread and stop the stream.
+
+        Order matters: clearing `_capturing` and stopping the stream releases a
+        dac writer blocked on the dacQueue (stop() cancels transfers and drains the
+        queue), after which the dac writer observes `_capturing == False` and exits.
+        """
+        if not self._capturing:
+            return
+        self._capturing = False
+        self.stream.stop()
+        if self._dac_writer is not None:
+            self._dac_writer.join(timeout=5.0)
 
     def capture(self, total_samples: int) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -285,51 +302,10 @@ class Analyzer:
                 two float64 arrays each of length ``total_samples``, values
                 in Volts (calibrated, same scale as ``send_receive()``).
         """
-        chunk_bytes = 16384  # 16 kB per USB transfer
-        bytes_per_stereo_sample = 8  # 2 × int32
-        need_bytes = total_samples * bytes_per_stereo_sample
-
-        # Number of DAC write / ADC read pairs needed to cover need_bytes.
-        # Each pair transfers chunk_bytes ADC bytes.
-        n_chunks = -(-need_bytes // chunk_bytes)  # ceiling division
-
-        max_int_value = 2**31 - 1
-
-        # -- single stream start ------------------------------------------------
-        self.stream.start()
+        # A fixed-length capture is just a continuous capture read once: start
+        # the gapless stream, read exactly total_samples, then stop.
+        self.start_capture()
         try:
-            # Submit all zero-DAC / ADC-read pairs up front so the USB host
-            # controller can pipeline them; no stop/restart in the middle.
-            for _ in range(n_chunks):
-                self.stream.write_zeros(chunk_bytes)
-
-            # Block until we have exactly the bytes we need
-            raw_bytes = self.stream.collect_adc_exact(need_bytes)
+            return self.read_capture(total_samples)
         finally:
-            self.stream.stop()
-        # -- stream stopped -----------------------------------------------------
-
-        # Deserialise interleaved int32 ADC data
-        interleaved = np.frombuffer(raw_bytes, dtype=np.int32)
-
-        left_int = interleaved[0::2]
-        right_int = interleaved[1::2]
-
-        # Trim to exact length (collect_adc_exact already trims, but be safe)
-        left_int = left_int[:total_samples]
-        right_int = right_int[:total_samples]
-
-        # Convert int32 → float64 in the range ±1
-        left_f = left_int.astype(np.float64) / max_int_value
-        right_f = right_int.astype(np.float64) / max_int_value
-
-        # Apply ADC calibration and dBFS → Volts conversion
-        cal_adc_left, cal_adc_right = self.control.get_adc_cal(
-            self.cal_data, self.params.max_input_level
-        )
-        adc_dbfs_correction = 10 ** ((self.params.max_input_level - 6) / 20)
-
-        left_volts = left_f * cal_adc_left * adc_dbfs_correction
-        right_volts = right_f * cal_adc_right * adc_dbfs_correction
-
-        return left_volts, right_volts
+            self.stop_capture()

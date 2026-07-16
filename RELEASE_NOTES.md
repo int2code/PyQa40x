@@ -1,3 +1,7 @@
+### 0.2.0
+
+[MINOR] Add endless audio capturing 
+
 ### 0.1.2
 
 [PATCH] Fix usb teardown deadlock.
