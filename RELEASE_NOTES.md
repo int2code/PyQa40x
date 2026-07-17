@@ -1,3 +1,7 @@
+### 0.2.1
+
+[PATCH] Restore removed `Analyzer.send_receive` functionality.
+
 ### 0.2.0
 
 [MINOR] Add endless audio capturing 
