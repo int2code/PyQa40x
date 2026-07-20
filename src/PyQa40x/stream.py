@@ -1,5 +1,7 @@
 import threading
 import queue
+import time
+
 import usb1
 import logging
 from typing import Callable
@@ -208,6 +210,22 @@ class Stream:
     def write_zeros(self, chunk_bytes: int = TRANSFER_BYTES) -> None:
         """Feed the ADC pipeline with a zero DAC buffer (continuous capture)."""
         self.write(bytes(chunk_bytes))
+
+    def collect_remaining_adc_data(self):
+        """
+        Waits for all remaining ADC transfers to complete and returns the collected data.
+
+        Returns:
+            bytearray: The collected ADC data.
+        """
+        while not self.adcQueue.empty():
+            time.sleep(0.01)
+
+        while not self._adc_data.empty():
+            chunk = self._adc_data.get()
+            self._adc_data_carry.extend(chunk)
+
+        return self._adc_data_carry
 
     def consume_adc(
         self,

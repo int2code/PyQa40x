@@ -1,5 +1,6 @@
 import threading
 import logging
+import struct
 
 import numpy as np
 import usb1  # pip install libusb1
@@ -11,6 +12,7 @@ from PyQa40x.stream import Stream
 from PyQa40x.helpers import *
 from PyQa40x.analyzer_params import AnalyzerParams
 from PyQa40x.bluetooth import BluetoothAudioDevice
+from PyQa40x.wave_sine import Wave
 
 logger = logging.getLogger(__name__)
 
@@ -276,6 +278,122 @@ class Analyzer:
         self.stream.stop()
         if self._dac_writer is not None:
             self._dac_writer.join(timeout=5.0)
+
+    def send_receive(self, left_wave: Wave, right_wave: Wave) -> tuple[Wave, Wave]:
+        """
+        Sends DAC data to the device and receives ADC data.
+
+        Args:
+            left_wave (Wave): Wave instance with left channel DAC data.
+            right_wave (Wave): Wave instance with right channel DAC data.
+
+        Returns:
+            tuple[Wave, Wave]: Tuple containing Wave instances with left and right channel ADC data.
+        """
+        left_dac_data = left_wave.get_buffer()
+        right_dac_data = right_wave.get_buffer()
+
+        # On QA402 and QA403, outputs need to be swapped
+        left_dac_data, right_dac_data = right_dac_data, left_dac_data
+
+        left_peak = np.max(left_dac_data)
+
+        # Get calibration factors for outgoing data
+        cal_dac_left, cal_dac_right = self.control.get_dac_cal(
+            self.cal_data, self.params.max_output_level
+        )
+
+        # Convert to dBFS. Note the 3 dB adjustment--dBFS is peak, while dBV is RMS
+        dac_dbfs_adjustment = 10 ** -((self.params.max_output_level + 3) / 20)
+
+        # Apply calibration and dBFS scaling
+        left_dac_data = left_dac_data * dac_dbfs_adjustment * cal_dac_left
+        right_dac_data = right_dac_data * dac_dbfs_adjustment * cal_dac_right
+
+        # Convert incoming doubles to float
+        left_dac_data_float = left_dac_data.astype(np.float32)
+        right_dac_data_float = right_dac_data.astype(np.float32)
+
+        # Interleave the left and right channels
+        interleaved_dac_data = np.empty(
+            (left_dac_data_float.size + right_dac_data_float.size,), dtype=np.float32
+        )
+        interleaved_dac_data[0::2] = left_dac_data_float
+        interleaved_dac_data[1::2] = right_dac_data_float
+
+        # Convert to bytes, multiplying by max int value
+        max_int_value = 2 ** 31 - 1
+        interleaved_dac_data = (interleaved_dac_data * max_int_value).astype(np.int32)
+
+        # Pack the data into chunks of 16k bytes
+        chunk_size = 16384  # 16k bytes
+        num_ints_per_chunk = chunk_size // 4  # 32-bit ints, so 4 bytes per int
+        total_chunks = len(interleaved_dac_data) // num_ints_per_chunk
+
+        self.stream.start()
+
+        # Play wave on Bluetooth if available
+        bt_thread = None
+        if self.bt_device:
+            # Play both left and right waves on Bluetooth
+            bt_thread = self.bt_device.play_wave_background(left_wave, right_wave)
+
+        try:
+            for i in range(total_chunks):
+                chunk = interleaved_dac_data[
+                        i * num_ints_per_chunk: (i + 1) * num_ints_per_chunk
+                        ]
+                buffer = struct.pack("<%di" % len(chunk), *chunk)
+                self.stream.write(buffer)
+        finally:
+            self.stream.stop()
+
+        # Collect ADC data. This is bytes
+        interleaved_adc_data = self.stream.collect_remaining_adc_data()
+
+        # Wait for the Bluetooth thread to finish after processing
+        if bt_thread:
+            bt_thread.join()
+
+        # Convert collected ADC data back to int
+        interleaved_adc_data = np.frombuffer(interleaved_adc_data, dtype=np.int32)
+
+        # Separate interleaved ADC data into left and right channels. This is int
+        left_adc_data_int = interleaved_adc_data[0::2]
+        right_adc_data_int = interleaved_adc_data[1::2]
+
+        # Convert left and right channels back to double
+        left_adc_data = left_adc_data_int.astype(np.float64) / max_int_value
+        right_adc_data = right_adc_data_int.astype(np.float64) / max_int_value
+
+        # Get calibration factors for incoming data
+        cal_adc_left, cal_adc_right = self.control.get_adc_cal(
+            self.cal_data, self.params.max_input_level
+        )
+
+        # Convert from dBFS to dBV. Note the 6 dB factor--the ADC is differential
+        adc_dbfs_correction = 10 ** ((self.params.max_input_level - 6) / 20)
+
+        # Apply calibration and dBFS scaling
+        left_adc_data = left_adc_data * cal_adc_left * adc_dbfs_correction
+        right_adc_data = right_adc_data * cal_adc_right * adc_dbfs_correction
+
+        # Ensure the buffer matches the expected shape. Is this needed?
+        expected_shape = (
+            self.params.pre_buf + self.params.fft_size + self.params.post_buf,
+        )
+        if left_adc_data.shape[0] != expected_shape[0]:
+            left_adc_data = np.resize(left_adc_data, expected_shape)
+        if right_adc_data.shape[0] != expected_shape[0]:
+            right_adc_data = np.resize(right_adc_data, expected_shape)
+
+        # Create instances of Wave with the full buffers
+        left_wave = Wave(self.params)
+        right_wave = Wave(self.params)
+        left_wave.set_buffer(left_adc_data)
+        right_wave.set_buffer(right_adc_data)
+
+        return left_wave, right_wave
 
     def capture(self, total_samples: int) -> tuple[np.ndarray, np.ndarray]:
         """
