@@ -46,7 +46,7 @@ class Control:
         """
         val = self.samplerate2reg[rate]
         self.registers.write(9, val)
-        time.sleep(0.1)  # A small delay to ensure the sample rate is set
+        time.sleep(0.2)  # A small delay to ensure the sample rate is set
 
     def load_calibration(self):
         """

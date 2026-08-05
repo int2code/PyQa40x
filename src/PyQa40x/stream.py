@@ -29,7 +29,7 @@ class Stream:
     """
 
     TRANSFER_TIMEOUT_MS = 1000  # Timeout for USB transfers in milliseconds
-    TRANSFER_BYTES = 16384  # 16 kB per USB bulk transfer (hardware chunk size)
+    DEFAULT_TRANSFER_BYTES = 16384  # 16 kB per USB bulk transfer (hardware chunk size)
     # cap on unread ADC data before overflow
     MAX_BUFFERED_BYTES = 256 * 1024 * 1024
 
@@ -38,6 +38,7 @@ class Stream:
         context: usb1.USBContext,
         device: usb1.USBDeviceHandle,
         registers: Registers,
+        transfer_bytes_size: int = DEFAULT_TRANSFER_BYTES
     ) -> None:
         """
         Initialize the Stream.
@@ -46,10 +47,12 @@ class Stream:
             context (usb1.USBContext): The USB context.
             device (usb1.USBDeviceHandle): The USB device handle.
             registers (Registers): The Registers instance for control writes.
+            transfer_bytes_size (int):
         """
         self.context = context
         self.device = device
         self.registers = registers
+        self.transfer_bytes_size = transfer_bytes_size  # USB bulk transfer (hardware chunk size)
         self.endpoint_read = usb1.ENDPOINT_IN | 0x02  # EP2 in
         self.endpoint_write = usb1.ENDPOINT_OUT | 0x02  # EP2 out
         self.dacQueue = queue.Queue(
@@ -81,7 +84,7 @@ class Stream:
         self._adc_data_carry = bytearray()  # leftover ADC bytes between consume_adc calls
         # latched, raised by consume_adc
         self._overflow_error: AdcOverflowError | None = None
-        self._max_queued_chunks = self.MAX_BUFFERED_BYTES // self.TRANSFER_BYTES
+        self._max_queued_chunks = self.MAX_BUFFERED_BYTES // self.transfer_bytes_size
 
     @property
     def overflow_error(self) -> "AdcOverflowError | None":
@@ -207,7 +210,7 @@ class Stream:
         self.dacQueue.put(dac)
         self.adcQueue.put(read)
 
-    def write_zeros(self, chunk_bytes: int = TRANSFER_BYTES) -> None:
+    def write_zeros(self, chunk_bytes: int = DEFAULT_TRANSFER_BYTES) -> None:
         """Feed the ADC pipeline with a zero DAC buffer (continuous capture)."""
         self.write(bytes(chunk_bytes))
 

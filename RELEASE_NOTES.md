@@ -1,3 +1,7 @@
+### 0.2.2
+
+[PATCH] Allow reliable streaming for higher sample rates (`96kHz`, `192kHz`).
+
 ### 0.2.1
 
 [PATCH] Restore removed `Analyzer.send_receive` functionality.
