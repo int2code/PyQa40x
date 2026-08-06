@@ -16,10 +16,16 @@ from PyQa40x.wave_sine import Wave
 
 logger = logging.getLogger(__name__)
 
+# Sample rate Hz vs bytes per USB transfer
+TRANSFER_BYTES_MAP = {
+    44100: Stream.DEFAULT_TRANSFER_BYTES,
+    48000: Stream.DEFAULT_TRANSFER_BYTES,
+    96000: 32768,
+    192000: 65536,
+}
+
 
 class Analyzer:
-
-    CAPTURE_CHUNK_BYTES = Stream.TRANSFER_BYTES  # bytes per USB transfer
 
     def __init__(self):
         """
@@ -27,6 +33,7 @@ class Analyzer:
         """
         self.params: AnalyzerParams | None = None
         self.context: usb1.USBContext | None = None
+        self.chunk_size: int | None = None
         self.device: usb1.USBDeviceHandle | None = None
         self.registers: Registers | None = None
         self.control: Control | None = None
@@ -80,6 +87,7 @@ class Analyzer:
         )
         self.context = usb1.USBContext()
         self.context.open()
+        self.chunk_size = TRANSFER_BYTES_MAP.get(sample_rate, Stream.DEFAULT_TRANSFER_BYTES)
 
         # Attempt to open QA402 or QA403 device
         self.device = self.context.openByVendorIDAndProductID(0x16C0, 0x4E37)  # QA402
@@ -94,7 +102,7 @@ class Analyzer:
 
         self.registers = Registers(self.device)
         self.control = Control(self.registers)
-        self.stream = Stream(self.context, self.device, self.registers)
+        self.stream = Stream(self.context, self.device, self.registers, self.chunk_size)
 
         # Load calibration data
         self.cal_data = self.control.load_calibration()
@@ -214,7 +222,7 @@ class Analyzer:
         """Continuously submit zero-DAC / ADC-read transfer pairs while capturing."""
         while self._capturing and self.stream.running:
             try:
-                self.stream.write_zeros(self.CAPTURE_CHUNK_BYTES)
+                self.stream.write_zeros(self.chunk_size)
             except Exception as exc:  # pylint: disable=broad-except
                 # Racing with stop() is expected; a real failure while we still
                 # expect to run is recorded in the post-loop reconciliation below.
@@ -325,9 +333,7 @@ class Analyzer:
         max_int_value = 2 ** 31 - 1
         interleaved_dac_data = (interleaved_dac_data * max_int_value).astype(np.int32)
 
-        # Pack the data into chunks of 16k bytes
-        chunk_size = 16384  # 16k bytes
-        num_ints_per_chunk = chunk_size // 4  # 32-bit ints, so 4 bytes per int
+        num_ints_per_chunk = self.chunk_size // 4  # 32-bit ints, so 4 bytes per int
         total_chunks = len(interleaved_dac_data) // num_ints_per_chunk
 
         self.stream.start()
