@@ -27,6 +27,9 @@ TRANSFER_BYTES_MAP = {
 
 class Analyzer:
 
+    VENDOR_ID = 0x16C0
+    PRODUCT_IDS = (0x4E37, 0x4E39)  # QA402, QA403
+
     def __init__(self):
         """
         Initializes the Analyzer class.
@@ -45,6 +48,55 @@ class Analyzer:
         self._dac_writer: threading.Thread | None = None  # set in start_capture()
         self._dac_writer_error: Exception | None = None  # error from DAC writer thread
 
+    def _open_analyzer(self, usb_serial: str | None = None):
+        """
+        Opens a QA402/QA403 analyzer on the USB bus.
+
+        Args:
+            usb_serial (str | None): USB serial number of the analyzer to open.
+                None opens the first analyzer found, which is the behaviour of
+                every release before serial selection was added.
+
+        Returns:
+            usb1.USBDeviceHandle: Handle of the opened analyzer.
+
+        Raises:
+            SystemExit: If no analyzer is connected, or if none of the connected
+                analyzers has the requested serial number.
+        """
+        if usb_serial is None:
+            for product_id in self.PRODUCT_IDS:
+                device = self.context.openByVendorIDAndProductID(
+                    self.VENDOR_ID, product_id
+                )
+                if device is not None:
+                    return device
+            raise SystemExit("No QA402/QA403 analyzer found")
+
+        connected: list[str] = []
+        for device in self.context.getDeviceList(skip_on_error=True):
+            if (
+                device.getVendorID() != self.VENDOR_ID
+                or device.getProductID() not in self.PRODUCT_IDS
+            ):
+                continue
+            try:
+                serial = device.getSerialNumber()
+            except usb1.USBError as error:
+                # Unreadable serial (usually missing udev permissions): the
+                # device cannot be matched, so report it as unknown.
+                logging.warning("Cannot read serial of a QA40x analyzer: %s", error)
+                serial = None
+            if serial == usb_serial:
+                logging.info("Opening QA40x analyzer with serial %s", serial)
+                return device.open()
+            connected.append(repr(serial))
+
+        raise SystemExit(
+            f"No QA402/QA403 analyzer with serial {usb_serial!r} found "
+            f"(connected: {', '.join(connected) or 'none'})"
+        )
+
     def init(
         self,
         sample_rate: int = 48000,
@@ -57,6 +109,7 @@ class Analyzer:
         amplitude_unit: str = "dbv",
         distortion_unit: str = "db",
         bt_device_name: str = "",
+        usb_serial: str | None = None,
     ) -> AnalyzerParams:
         """
         Initializes the analyzer hardware with the specified parameters.
@@ -72,6 +125,9 @@ class Analyzer:
             amplitude_unit (str): Unit for amplitude measurements, default is "dbv".
             distortion_unit (str): Unit for distortion measurements, default is "db".
             bt_device_name (str): Name of the Bluetooth device to use. Default is empty.
+            usb_serial (str | None): USB serial number of the analyzer to open,
+                e.g. "4334_E3B6". Needed only when several analyzers are
+                connected. Default None opens the first QA402/QA403 found.
 
         Returns:
             AnalyzerParams: A class instance containing the hardware and parameter settings.
@@ -87,16 +143,12 @@ class Analyzer:
         )
         self.context = usb1.USBContext()
         self.context.open()
-        self.chunk_size = TRANSFER_BYTES_MAP.get(sample_rate, Stream.DEFAULT_TRANSFER_BYTES)
+        self.chunk_size = TRANSFER_BYTES_MAP.get(
+            sample_rate, Stream.DEFAULT_TRANSFER_BYTES
+        )
 
-        # Attempt to open QA402 or QA403 device
-        self.device = self.context.openByVendorIDAndProductID(0x16C0, 0x4E37)  # QA402
-        if self.device is None:
-            self.device = self.context.openByVendorIDAndProductID(
-                0x16C0, 0x4E39
-            )  # QA403
-            if self.device is None:
-                raise SystemExit("No QA402/QA403 analyzer found")
+        # Attempt to open the requested QA402/QA403 device, or the first one
+        self.device = self._open_analyzer(usb_serial)
         self.device.resetDevice()
         self.device.claimInterface(0)
 
@@ -330,7 +382,7 @@ class Analyzer:
         interleaved_dac_data[1::2] = right_dac_data_float
 
         # Convert to bytes, multiplying by max int value
-        max_int_value = 2 ** 31 - 1
+        max_int_value = 2**31 - 1
         interleaved_dac_data = (interleaved_dac_data * max_int_value).astype(np.int32)
 
         num_ints_per_chunk = self.chunk_size // 4  # 32-bit ints, so 4 bytes per int
@@ -347,8 +399,8 @@ class Analyzer:
         try:
             for i in range(total_chunks):
                 chunk = interleaved_dac_data[
-                        i * num_ints_per_chunk: (i + 1) * num_ints_per_chunk
-                        ]
+                    i * num_ints_per_chunk : (i + 1) * num_ints_per_chunk
+                ]
                 buffer = struct.pack("<%di" % len(chunk), *chunk)
                 self.stream.write(buffer)
         finally:
