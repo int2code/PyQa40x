@@ -193,22 +193,34 @@ class Stream:
 
     def write(self, buffer: bytes) -> None:
         """Submit one DAC playback buffer and one matching ADC read transfer."""
-        with self._transfer_lock:
-            if not self.running:
-                raise RuntimeError(
-                    "Stream is not running; call start() first.")
-            dac = self.device.getTransfer()
-            dac.setBulk(self.endpoint_write, buffer, self.transfer_helper,
-                        self._epoch, self.TRANSFER_TIMEOUT_MS)
-            dac.submit()
-            self._pending_transfers.add(dac)
-            read = self.device.getTransfer()
-            read.setBulk(self.endpoint_read, len(buffer), self.transfer_helper,
-                         self._epoch, self.TRANSFER_TIMEOUT_MS)
-            read.submit()
-            self._pending_transfers.add(read)
+        dac = self.device.getTransfer()
+        read = self.device.getTransfer()
+        # Enqueue before submit: a transfer can complete, and its callback
+        # drain the queue, before submit() returns.
         self.dacQueue.put(dac)
         self.adcQueue.put(read)
+        dac_submitted = read_submitted = False
+        with self._transfer_lock:
+            try:
+                if not self.running:
+                    raise RuntimeError(
+                        "Stream is not running; call start() first.")
+                dac.setBulk(self.endpoint_write, buffer, self.transfer_helper,
+                            self._epoch, self.TRANSFER_TIMEOUT_MS)
+                dac.submit()
+                dac_submitted = True
+                self._pending_transfers.add(dac)
+                read.setBulk(self.endpoint_read, len(buffer), self.transfer_helper,
+                             self._epoch, self.TRANSFER_TIMEOUT_MS)
+                read.submit()
+                read_submitted = True
+                self._pending_transfers.add(read)
+            except Exception:
+                if not dac_submitted:
+                    self.dacQueue.get_nowait()
+                if not read_submitted:
+                    self.adcQueue.get_nowait()
+                raise
 
     def write_zeros(self, chunk_bytes: int = DEFAULT_TRANSFER_BYTES) -> None:
         """Feed the ADC pipeline with a zero DAC buffer (continuous capture)."""
