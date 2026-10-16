@@ -1,3 +1,7 @@
+### 0.3.2
+
+[PATCH] Add modifying max input level
+
 ### 0.3.1
 
 [PATCH] Fix Stream.write() - ensure transfer queues not empty.
