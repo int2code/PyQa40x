@@ -177,6 +177,27 @@ class Analyzer:
 
         return self.params
 
+    def set_max_input_level(self, max_input_level: int) -> None:
+        """
+        Set the input attenuator to `max_input_level` dBV.
+
+        Args:
+            max_input_level (int): Maximum input level in dBV. Valid values are 0, 6, 12, 18, 24, 30, 36, 42.
+
+        Raises:
+            ValueError: If `max_input_level` is not a valid level.
+            RuntimeError: If a capture is running.
+        """
+        if max_input_level not in self.control.input2reg:
+            raise ValueError(
+                f"Invalid max input level {max_input_level} dBV; valid values are "
+                f"{sorted(self.control.input2reg)}."
+            )
+        if self._capturing:
+            raise RuntimeError("Cannot change the max input level while capturing.")
+        self.control.set_input(max_input_level)
+        self.params.max_input_level = max_input_level
+
     def cleanup(self):
         """
         Releases the USB device interface and closes the context.
